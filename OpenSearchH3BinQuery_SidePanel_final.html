@@ -1,0 +1,571 @@
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no" />
+    <title>Working with H3 bins from GeoAnalytics Engine in ArcGIS JS API 4.29</title>
+    <style>
+        html,
+        body {
+          padding: 0;
+          margin: 0;
+          height: 100%;
+          width: 100%;
+        }
+  
+        #viewDiv {
+          float: left;
+          padding: 0;
+          margin: 0;
+          height: 100%;
+          width: 65%;
+        }
+  
+        #feature-node {
+          float: left;
+          width: 35%;
+          height: 100%;
+          padding: 1em;
+          overflow: scroll;
+          max-height: 100%;
+        }
+
+        #mainWindow {
+            padding: .5em;
+            background-color: #fff;
+        }
+        #mainWindow p, #uploadForm {
+            display: block;
+            padding: .1em;
+        }
+        
+    </style>
+    <link rel="stylesheet" href="https://js.arcgis.com/4.29/esri/themes/light/main.css" />
+    <script src="https://unpkg.com/h3-js"></script>
+    <script src="https://js.arcgis.com/4.29/"></script>    
+    <script>
+    require(["esri/Map", "esri/views/MapView", "esri/geometry/Point", "esri/layers/GraphicsLayer",  "esri/layers/FeatureLayer","esri/layers/CSVLayer","esri/Graphic", "esri/widgets/Feature","esri/widgets/Expand", "esri/core/promiseUtils"], 
+    (Map, MapView, Point, GraphicsLayer,FeatureLayer,CSVLayer, Graphic, Feature, Expand, promiseUtils) => {
+        
+        let dateiname=""
+        document.getElementById("uploadForm").addEventListener("change", (event) => {
+            const fileName = event.target.value.toLowerCase();
+            if (fileName.indexOf(".csv") !== -1) {
+                dateiname = event.target.files[0].name.replace(".csv", "_enriched.csv")
+                addCSVLayer(event.target.files[0]);
+            }
+            else {
+                document.getElementById('upload-status').innerHTML = '<p style="color:red">Only CSV Files are currently supported.</p>';
+            }
+        });
+
+        function addCSVLayer(file) {
+            const visualizeData = document.getElementById("visualizeCheckbox").checked;
+            if (visualizeData) {
+                const csvRenderer = {
+                    type: "simple", // autocasts as new SimpleRenderer()
+                    symbol: {type: "picture-marker",  // autocasts as new PictureMarkerSymbol()
+                        url: "https://static.arcgis.com/images/Symbols/Firefly/FireflyB3.png",
+                        width: "12px",
+                        height: "12px"}
+                };
+                
+                const blob = new Blob([file], {
+                    type: "plain/text"
+                });
+                let url = URL.createObjectURL(blob);
+                console.log(url)
+                const clayer = new CSVLayer({
+                    url: url,
+                    popupEnabled: true,
+                    renderer:csvRenderer
+                });
+                console.log(clayer)
+                map.add(clayer);
+            }
+
+            const openSearchConfig = {
+                host: "http://localhost:9200",
+                indexName: "risks_merged_bins_lod8_de2",
+            };
+
+            const reader = new FileReader();
+            reader.onload = async function (e) {
+                const csvData = e.target.result;
+                const rows = csvData.split("\n").map(row => row.split(","));
+                const headers = rows[0];
+                const data = rows.slice(1);
+
+                const startTime = new Date();
+
+                // Read batch size and parallel processing state
+                const batchSize = parseInt(document.getElementById("batchSizeInput").value, 10) || 100;
+                const parallelProcessing = document.getElementById("parallelCheckbox").checked;
+
+                console.log("Batch Size:", batchSize);
+                console.log("Parallel Processing Enabled:", parallelProcessing);
+
+                let updatedData;
+                if (parallelProcessing) {
+                    // Process data in parallel
+                    updatedData = await processBatchesParallel(data, openSearchConfig, headers);
+                } else {
+                    // Process data sequentially
+                    updatedData = await processBatchesSequential(data, openSearchConfig, headers);
+                }
+
+                // Save enriched data
+                saveCsvIncrementally(headers, updatedData, file.name.replace(".csv", "_enriched.csv"));
+
+                const endTime = new Date();
+                const duration = (endTime - startTime) / 1000; // Convert to seconds
+                alert(`${rows.length - 1} rows successfully enriched in ${duration} seconds.`);
+            };
+
+            reader.readAsText(file);
+        }
+
+
+        async function saveCsvIncrementally(headers, enrichedData, fileName) {
+            const blobParts = [];
+            blobParts.push(headers.concat("opensearch_results").join(",") + "\n");
+
+            enrichedData.forEach(row => {
+                blobParts.push(row.join(",") + "\n");
+            });
+
+            const blob = new Blob(blobParts, { type: "text/csv" });
+            const link = document.createElement("a");
+            link.href = URL.createObjectURL(blob);
+            link.download = fileName;
+            link.click();
+        }
+
+        // Bulk query to OpenSearch
+        async function queryOpenSearchBatch(config, queries) {
+            const url = `${config.host}/${config.indexName}/_msearch`; // Multi-Search API
+            const requestBody = queries
+                .map(query => `{}\n${JSON.stringify(query)}\n`)
+                .join("") + "\n";
+            //console.log(requestBody)
+            const response = await fetch(url, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/x-ndjson"
+                    //"Authorization": "Basic " + btoa(`${config.username}:${config.password}`)
+                },
+                body: requestBody
+            });
+
+            if (!response.ok) {
+                console.error("Batch query error:", await response.text());
+                return [];
+            }
+
+            const result = await response.json();
+            console.log(result)
+            return result.responses.map(res => res.hits?.hits.map(hit => hit._source) || []);
+        }
+
+        async function processBatchesSequential(data, config, headers) {
+            const progressBar = document.getElementById("progressBar");
+            const progressPercentage = document.getElementById("progressPercentage");
+            const batchSize = parseInt(document.getElementById("batchSizeInput").value, 10) || 100;
+
+            let updatedData = [];
+            for (let i = 0; i < data.length; i += batchSize) {
+                const batch = data.slice(i, i + batchSize);
+
+                // Process each batch sequentially
+                const enrichedBatch = await processChunk(batch, config, headers);
+                updatedData = updatedData.concat(enrichedBatch);
+
+                // Update progress bar
+                const progress = Math.min(((i + batchSize) / data.length) * 100, 100);
+                progressBar.value = progress;
+                progressPercentage.innerText = `${Math.floor(progress)}%`;
+
+                console.log(`Processed batch ${(i / batchSize) + 1}`);
+            }
+
+            return updatedData;
+        }
+
+
+        // Process data in batches, generating queries based on H3 indices   
+        async function processBatchesParallel(data, config, headers) {
+            const progressBar = document.getElementById("progressBar");
+            const progressPercentage = document.getElementById("progressPercentage");
+            const batchSize = parseInt(document.getElementById("batchSizeInput").value, 10) || 100;
+
+            // Divide data into batches
+            const totalBatches = Math.ceil(data.length / batchSize);
+            const batches = [];
+            for (let i = 0; i < data.length; i += batchSize) {
+                batches.push(data.slice(i, i + batchSize));
+            }
+
+            let updatedData = [];
+            let processedCount = 0;
+
+            // Process all batches in parallel
+            await Promise.all(
+                batches.map(async (batch, index) => {
+                    const enrichedBatch = await processChunk(batch, config, headers);
+                    updatedData = updatedData.concat(enrichedBatch);
+
+                    // Incrementally update progress
+                    processedCount += batch.length;
+                    const progress = Math.min((processedCount / data.length) * 100, 100);
+                    progressBar.value = progress;
+                    progressPercentage.innerText = `${Math.floor(progress)}%`;
+
+                    //console.log(`Batch ${index + 1}/${totalBatches} processed.`);
+                })
+            );
+
+            return updatedData;
+        }
+
+        async function processChunk(chunk, config, headers) {
+            const queries = chunk.map(row => {
+                const latIndex = headers.indexOf("Lat");
+                const lonIndex = headers.indexOf("Lon");
+
+                const lat = parseFloat(row[latIndex]?.trim());
+                const lon = parseFloat(row[lonIndex]?.trim());
+
+                if (!isNaN(lat) && !isNaN(lon)) {
+                    const h3Index = h3.latLngToCell(lat, lon, 8);
+                    return {
+                        query: {
+                            match_phrase: {
+                                bin_hex: h3Index
+                            }
+                        }
+                    };
+                } else {
+                    console.warn("Invalid lat/lon detected:", row);
+                    return null;
+                }
+            }).filter(query => query !== null);
+
+            // Perform batch query for this chunk
+            const results = await queryOpenSearchBatch(config, queries);
+
+            // Map results back to rows
+            return chunk.map((row, idx) => {
+                const result = results[idx] || {};
+                return row.concat(JSON.stringify(result));
+            });
+        }  
+        
+////////////////////////////////////////////////////////////////////////////////////////
+        
+        const map = new Map({
+          basemap: "gray-vector"
+        });
+
+        const view = new MapView({
+          container: "viewDiv",
+          map: map,
+          zoom: 9,
+          center: [7, 51],
+          popup: {
+            autoOpenEnabled: false
+          }
+        });
+
+        const fileForm = document.getElementById("mainWindow");
+
+        const expand = new Expand({
+            expandIcon: "upload",
+            view: view,
+            content: fileForm
+        });
+
+        view.ui.add(expand, "top-right");
+        
+        // Add graphic when GraphicsLayer is constructed
+        let layer = new GraphicsLayer({ });
+        map.add(layer);
+
+        view.when().then(() => {
+            // Create a default graphic for when the application starts
+            const graphic = {
+                popupTemplate: {
+                    content: "Klicken um entsprechenden H3 Bin der Location abzurufen. Informationen werden über Mouse Over hier angezeigt ..."
+                }
+            };
+
+
+            // Provide graphic to a new instance of a Feature widget
+            const feature = new Feature({
+                container: "feature-node",
+                graphic: graphic,
+                map: view.map,
+                spatialReference: view.spatialReference
+            });
+
+
+            view.whenLayerView(layer).then((layerView) => {
+                let highlight;
+                let objectId;
+                let newObjectId;
+
+                const debouncedUpdate = promiseUtils.debounce(async (event) => {
+                    // Perform a hitTest on the View
+                    const hitTest = await view.hitTest(event, {
+                        include: layer
+                    });
+                    // Make sure graphic has a popupTemplate
+                    const results = hitTest.results.filter((result) => {
+                        //console.log(result)
+                        //console.log(result.graphic.popupTemplate)
+                        //console.log(result.graphic.attributes)
+                        newObjectId = result.graphic.attributes && result.graphic.attributes["H3IdHex"] != objectId;
+                        if (newObjectId) {
+                            highlight?.remove();
+                            objectId = result.graphic.attributes["H3IdHex"];
+                            //console.log("MOVED")
+                            feature.graphic = result.graphic
+                            highlight = layerView.highlight(result.graphic);
+                        }
+
+                        return result.graphic.popupTemplate;
+                    });
+                });
+            
+                view.on("pointer-move", (event) => {
+                    debouncedUpdate(event).catch((err) => {
+                    if (!promiseUtils.isAbortError(err)) {
+                        throw err;
+                    }
+                    });
+                });    
+
+                //On-Click Event
+                view.on("click", (event)=> {
+                    view.graphics.remove();
+                    //console.log(view.graphics)
+                    //console.log(event.mapPoint);
+                    
+                    //Create Point Graphic to view the click event on the map
+                    let point = new Point({
+                        type: "point",
+                        //Using lon / lat instead of x/y will use WGS84 instead of screenpoints
+                        x: event.mapPoint.longitude,
+                        y: event.mapPoint.latitude
+                    })
+
+                    let markerSymbol = {
+                        type: "simple-marker",
+                        size: 5,
+                        color: [0, 0, 255, 0.5]
+                    };
+
+                    let pointGraphic = new Graphic({
+                        geometry: point,
+                        symbol: markerSymbol
+                    });        
+
+                    //Getting H3 BinId for respective Point Location
+                    h3_hex_bin_id = h3.latLngToCell(point.y, point.x, 8)
+                    //console.log(h3_hex_bin_id)
+                    //Getting H3 Hex Boundary for derived H3 BinId
+                    var hex_poly = h3.cellToBoundary(h3_hex_bin_id)
+                    //console.log(hex_poly)
+
+                    //Switching up lat/lon in Boundary coordinates
+                    for (var i = 0; i < hex_poly.length; i++) {
+                        var temp = hex_poly[i][0];
+                        hex_poly[i][0] = hex_poly[i][1]; 
+                        hex_poly[i][1] = temp; 
+                    }
+                    //Adding first coordinate as last to close ring
+                    hex_poly.push(hex_poly[0])
+                    //console.log(hex_poly)
+
+                    //Perform Request to locale OpenSearch to get Attribute information
+                    var xhr = new XMLHttpRequest();
+                    xhr.open("POST", "http://localhost:9200/risks_merged_bins_lod8_de2/_search", true);
+                    xhr.setRequestHeader('Content-Type', 'application/json');
+                    //xhr.send(JSON.stringify({"query":{"query_string":{"query":"bin_hex:\"8a1fad565a1ffff\""}},"size":10,"from":0,"sort":[]}))
+                    xhr.send(JSON.stringify({
+                        "query": {
+                        "match_phrase": {
+                            "bin_hex":h3_hex_bin_id
+                        }
+                        }
+                    }));
+                    xhr.onload = function() {
+                        var data = JSON.parse(this.responseText);
+                        //console.log(data.hits.hits[0])
+                        let hexBinAttr = {}
+                        if (data.hits.hits[0]){
+                        hexBinAttr = {
+                            H3IdHex: data.hits.hits[0]._source.bin_hex,
+                            H3Id: data.hits.hits[0]._source.bin_str,
+                            MobileCellsCount: data.hits.hits[0]._source.MobileCellsCount,
+                            FloodRisk: data.hits.hits[0]._source.FloodRisk,
+                            Kreisname: data.hits.hits[0]._source.Kreisname,
+                            Sachschaden_Natur_Häufigkeit_in_Prozent: data.hits.hits[0]._source.Sachschaden_Natur_Häufigkeit_in_Prozent,
+                            Sachschaden_Natur_Schadendurchschnitt_in_EUR: data.hits.hits[0]._source.Sachschaden_Natur_Schadendurchschnitt_in_EUR,
+                            Schadenhäufigkeit_Sturm_Hagel: data.hits.hits[0]._source.Schadenhäufigkeit_Sturm_Hagel,
+                            Zahl_Sachschäden_Sturm_Hagel_deutschlandweit_in_Tsd: data.hits.hits[0]._source.Zahl_Sachschäden_Sturm_Hagel_deutschlandweit_in_Tsd,
+                            Sachschaden_Sturm_Hagel_Durchschnitt_in_EUR: data.hits.hits[0]._source.Sachschaden_Sturm_Hagel_Durchschnitt_in_EUR,
+                            Schaden_in_21_Jahren_pro_Gebäude_in_EUR: data.hits.hits[0]._source.Schaden_in_21_Jahren_pro_Gebäude_in_EUR,
+                            WGB_Überschwemmung_Starkregen_Erdgefahren_Schneedruck_in_EUR: data.hits.hits[0]._source.WGB_Überschwemmung_Starkregen_Erdgefahren_Schneedruck_in_EUR,
+                            WGB_Sturm_Hagel_in_EUR: data.hits.hits[0]._source.WGB_Sturm_Hagel_in_EUR,
+                            WGB_Jährliche_Schadenhäufigkeit_Starkregen_in_Promille: data.hits.hits[0]._source.WGB_Jährliche_Schadenhäufigkeit_Starkregen_in_Promille,
+                            WGB_Schadendurchschnitt_Starkregen_in_EUR: data.hits.hits[0]._source.WGB_Schadendurchschnitt_Starkregen_in_EUR,
+                            Summe_Starkregenereignisse: data.hits.hits[0]._source.Summe_Starkregenereignisse,
+                            MobileCellsList: data.hits.hits[0]._source.MobileCells
+                            };
+                        }else{
+                        hexBinAttr = {
+                            H3IdHex: h3_hex_bin_id,
+                            H3Id: "Keine Risikodaten für diesen Punkt verfügbar."
+                            };
+                        }
+                        
+                        //Create Polygon Graphic to put Hexagon on the map
+                        var polygon = {
+                            type: "polygon",
+                            rings: hex_poly
+                        };
+                        const fillSymbol = {
+                            type: "simple-fill",
+                            color: [173,216,230, 0.8],
+                            outline: {
+                            color: [255, 255, 255],
+                            width: 1
+                            }
+                        };
+                    
+                        const hexGraphic = new Graphic({
+                            geometry: polygon,
+                            symbol: fillSymbol,
+                            attributes:hexBinAttr,
+                            popupTemplate: {
+                                // autocasts as new PopupTemplate()
+                                title: "{HexId}",
+                                content: [
+                                {
+                                    type: "fields",
+                                    fieldInfos: [
+                                    {
+                                        fieldName: "H3IdHex",
+                                        label:"H3 ID (Hex)"
+                                    },
+                                    {
+                                        fieldName: "H3Id",
+                                        label:"H3 ID (String)"
+                                    },
+                                    {
+                                        fieldName: "MobileCellsCount",
+                                        label:"Count Punktdaten"
+                                    },
+                                    {
+                                        fieldName: "FloodRisk",
+                                        label:"Überflutungsrisiko"
+                                    },
+                                    {
+                                        fieldName: "Kreisname",
+                                        label:"Kreisname"
+                                    },
+                                    {
+                                        fieldName: "Sachschaden_Natur_Häufigkeit_in_Prozent",
+                                        label:"Schadenhäufigkeit (%) - Sachversicherung - weitere Naturgefahren - 2002-2022"
+                                    },
+                                    {
+                                        fieldName: "Sachschaden_Natur_Schadendurchschnitt_in_EUR",
+                                        label:"Schadendurchschnitt (€) - Sachversicherung - weitere Naturgefahren - 2002-2022"
+                                    },
+                                    {
+                                        fieldName: "Schadenhäufigkeit_Sturm_Hagel",
+                                        label:"Schadenhäufigkeit (%) - Sachversicherung - Sturm/Hagel. - 1997-2022" 
+                                    },
+                                    {
+                                        fieldName: "Zahl_Sachschäden_Sturm_Hagel_deutschlandweit_in_Tsd",
+                                        label: "Anzahl Sachschäden - Sturm/Hagel. - 1997-2022" 
+                                    },
+                                    {
+                                        fieldName: "Sachschaden_Sturm_Hagel_Durchschnitt_in_EUR",
+                                        label:"Schadendurchschnitt (€) - Sturm/Hagel. - 1997-2022"
+                                    },
+                                    {
+                                        fieldName: "Schaden_in_21_Jahren_pro_Gebäude_in_EUR",
+                                        label:"Naturgefahrschäden in Deutschland an Gebäuden 2002 bis 2022"
+                                    },
+                                    {
+                                        fieldName: "WGB_Überschwemmung_Starkregen_Erdgefahren_Schneedruck_in_EUR",
+                                        label: "Wohngebäudeversicherung - Schadensumme (€) Überschwemmung & Starkregen, Erdgefahren & Schneedruck - 2002-2022"
+                                    },
+                                    {
+                                        fieldName: "WGB_Sturm_Hagel_in_EUR",
+                                        label: "Wohngebäudeversicherung - Schadensumme (€) Sturm & Hagel - 2002-2022"
+                                    },
+                                    {
+                                        fieldName: "WGB_Jährliche_Schadenhäufigkeit_Starkregen_in_Promille",
+                                        label:"Wohngebäudeversicherung - Starkregen. Jährliche Schadenhäufig - 2002-2022" 
+                                    },
+                                    {
+                                        fieldName: "WGB_Schadendurchschnitt_Starkregen_in_EUR",
+                                        label: "Wohngebäudeversicherung - Schadendurchschnitt (€) Starkregen - 2002-2022"
+                                    },
+                                    {
+                                        fieldName: "Summe_Starkregenereignisse",
+                                        label:"Wohngebäudeversicherung - Summe der Starkregenereignisse - 2002-2022"
+                                    },
+                                    {
+                                        fieldName: "MobileCellsList",
+                                        label:"Liste der Punktdaten"
+                                    }
+                                    ]
+                                }
+                                ]
+                            }
+                        });
+                        layer.addMany([hexGraphic,pointGraphic]);
+                        /* view.popup.open({
+                            features: [hexGraphic],
+                            location: pointGraphic.geometry
+                        }); */
+                    };
+                });                
+            });
+        });
+    });
+    </script>
+  </head>
+
+  <body>
+    <div id="feature-node" class="esri-widget"></div>
+    <div id="mainWindow">
+        <div>
+            <div style='padding-left:4px;'>
+            <p>Bitte CSV Datei zum Anreichern der Risiko Scores auswählen.</a></p>
+            <p>Diese muss eine Lat & Lon Spalte haben.</p>
+            <p></p><label for="batchSizeInput">Query Batch Size:</label>
+            <input id="batchSizeInput" type="number" value="1000" min="1000" step="1000" style="width: 80px;" /><br>
+            <label for="parallelCheckbox" style="margin-left: 10px;"><input type="checkbox" id="parallelCheckbox" />Parallele Prozessierung</label><br>
+            <label for="visualizeCheckbox" style="margin-left: 10px;"><input type="checkbox" id="visualizeCheckbox" checked/>Visualisiere Daten</label></p>
+            <form enctype="multipart/form-data" method="post" id="uploadForm">
+                <div class="field">
+                <label class="file-upload">
+                    <span><strong>CSV hinzufügen:</strong></span>
+                    <input type="file" name="file" id="inFile" />
+                </label>
+                </div>
+            </form>
+            <span class="file-upload-status" style="opacity:1;" id="upload-status"></span>
+            <div id="fileInfo"> </div>
+            <progress id="progressBar" max="100" value="0" style="width: 100%;"></progress>
+            <span id="progressPercentage">0%</span>
+            </div>
+        </div>
+    </div>
+    <div id="viewDiv">
+    </div>
+  </body>
+</html>
